@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# japanese_car_news_line_flex.py
+# japanese_car_news_line_text_broadcast.py
 # requirements: feedparser, requests, beautifulsoup4
 
 import os
@@ -8,13 +8,17 @@ import time
 import feedparser
 import requests
 from bs4 import BeautifulSoup
+from urllib.parse import urlparse
+from datetime import datetime
 
 # --------------------
 # 設定
 # --------------------
 LINE_TOKEN = os.getenv("LINE_CHANNEL_TOKEN")
 SENT_FILE = "sent_ids.json"
-MAX_POSTS_PER_RUN = 3   # Flexは情報量が多いので少数推奨
+
+# できるだけ多く届けたい前提で増やす（過剰配信はプランや月間上限に注意）
+MAX_POSTS_PER_RUN = 30
 
 BRANDS = [
     "トヨタ", "レクサス", "GR", "GR86",
@@ -43,8 +47,7 @@ RSS_URLS = [
     "https://bestcarweb.jp/rss",
 ]
 
-# デフォルトサムネイル（og:imageが無い場合に使用）
-# 実運用ではあなたの公開ホスティング（GitHub rawなど）URLに置き換えてください
+# og:image 取得は残してもテキスト主体なので未使用（必要なら本文へURL掲載でも可）
 DEFAULT_IMAGE = "https://raw.githubusercontent.com/your-username/your-repo/main/assets/default_card.jpg"
 
 # --------------------
@@ -59,18 +62,15 @@ def load_sent_ids():
     except Exception:
         return set()
 
-
 def save_sent_ids(s):
     with open(SENT_FILE, "w", encoding="utf-8") as f:
         json.dump(sorted(list(s)), f, ensure_ascii=False, indent=2)
 
-
-def short(text, n=200):
+def short(text, n=800):
     if not text:
         return ""
     t = " ".join(text.split())
     return (t[: n - 1] + "…") if len(t) > n else t
-
 
 def fetch_og_image(url):
     try:
@@ -88,14 +88,12 @@ def fetch_og_image(url):
         return None
     return None
 
-
 def detect_brand(title, summary=""):
     text = (title + " " + summary).lower()
     for b in BRANDS:
         if b.lower() in text:
             return b
     return None
-
 
 def is_gr86_text(title, summary=""):
     t = (title + " " + summary).lower()
@@ -105,78 +103,20 @@ def is_gr86_text(title, summary=""):
         return True
     return False
 
-# --------------------
-# Flex の作成（問題になりにくい安全な構造）
-# --------------------
+def domain_of(url):
+    try:
+        return urlparse(url).netloc
+    except Exception:
+        return ""
 
-def make_flex_bubble(title, brand, link, image_url=None, is_gr86=False):
-    """
-    LINE Flex の bubble を簡潔で確実な構造にする。
-    """
-    color_accent = "#E74C3C" if is_gr86 else "#2D9CDB"
-    img = image_url or DEFAULT_IMAGE
-
-    bubble = {
-        "type": "bubble",
-        "hero": {
-            "type": "image",
-            "url": img,
-            "size": "full",
-            "aspectRatio": "16:9",
-            "aspectMode": "cover"
-        },
-        "body": {
-            "type": "box",
-            "layout": "vertical",
-            "contents": [
-                {
-                    "type": "text",
-                    "text": ("$D83D$DD25 GR86速報：" if is_gr86 else f"【{brand}】") + title,
-                    "wrap": True,
-                    "weight": "bold",
-                    "size": "md"
-                },
-                {
-                    "type": "box",
-                    "layout": "vertical",
-                    "margin": "md",
-                    "contents": [
-                        {
-                            "type": "text",
-                            "text": brand or "（不明）",
-                            "size": "sm",
-                            "color": color_accent,
-                            "weight": "bold"
-                        }
-                    ]
-                }
-            ]
-        },
-        "footer": {
-            "type": "box",
-            "layout": "vertical",
-            "spacing": "sm",
-            "contents": [
-                {
-                    "type": "button",
-                    "style": "link",
-                    "height": "sm",
-                    "action": {
-                        "type": "uri",
-                        "label": "記事を開く",
-                        "uri": link
-                    }
-                }
-            ]
-        }
-    }
-    return bubble
-
+# --- UTF-16のコード単位数を正確に数える（LINEの文字数上限対策） ---
+def utf16_units(s: str) -> int:
+    # UTF-16-LEに変換したバイト長 / 2 がコード単位数
+    return len(s.encode("utf-16-le")) // 2
 
 # --------------------
 # RSS取得
 # --------------------
-
 def fetch_all_entries():
     entries = []
     seen_links = set()
@@ -194,84 +134,137 @@ def fetch_all_entries():
             print("RSS error:", url, ex)
     return entries
 
+# --------------------
+# テキスト生成
+# --------------------
+def render_item(gr86, brand, title, summary, link, pub):
+    # 絵文字は上限超過の原因になり得るため使用しない（安全運用）
+    lines = []
+    head = f"[{brand}] {title}"
+    lines.append(head)
+    if pub:
+        try:
+            # pub は文字列のことがあるのでそのまま表示
+            lines.append(f"公開日: {pub}")
+        except Exception:
+            pass
+    dom = domain_of(link)
+    if summary:
+        lines.append(f"概要: {short(summary, n=800)}")
+    lines.append(f"URL: {link}")
+    if dom:
+        lines.append(f"ソース: {dom}")
+    return "\n".join(lines)
+
+def build_text_messages(items, max_units_per_message=4800):
+    """
+    items: [(gr86, brand, title, summary, link, pub), ...]
+    できるだけ多くの記事を1メッセージに詰め、UTF-16単位の上限内で分割。
+    """
+    messages = []
+    current = []
+    # ヘッダー（日時付き）
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    header = f"自動車ニュースまとめ（{now}）\n"
+    cur_text = header
+    for it in items:
+        block = render_item(*it)
+        # 区切り線
+        block = block + "\n" + ("-" * 24) + "\n"
+        # 追加した場合の長さを見積もり
+        if utf16_units(cur_text + block) <= max_units_per_message:
+            cur_text += block
+        else:
+            # 現在のメッセージを確定
+            messages.append(cur_text.strip())
+            # 新しいメッセージを開始
+            cur_text = header + block
+    if cur_text.strip():
+        messages.append(cur_text.strip())
+    return messages
 
 # --------------------
-# LINE送信: Flex
+# LINE送信: テキスト（broadcast）
 # --------------------
-
-def send_flex_messages(flex_contents):
+def post_broadcast(message_objs):
     if not LINE_TOKEN:
-        print("$274C LINE_CHANNEL_TOKEN 未設定")
+        print("❌ LINE_CHANNEL_TOKEN 未設定")
         return False
     url = "https://api.line.me/v2/bot/message/broadcast"
     headers = {"Content-Type":"application/json", "Authorization":f"Bearer {LINE_TOKEN}"}
-    messages = []
-    for bubble in flex_contents:
-        alt = bubble.get("body", {}).get("contents", [{}])[0].get("text", "ニュース")
-        messages.append({
-            "type":"flex",
-            "altText": alt[:60],
-            "contents": bubble
-        })
-    payload = {"messages": messages}
+    payload = {"messages": message_objs}
     try:
-        r = requests.post(url, headers=headers, json=payload, timeout=15)
+        r = requests.post(url, headers=headers, json=payload, timeout=20)
         if r.status_code in (200,201):
-            print("$2705 LINE flex broadcast success")
+            print("✅ LINE text broadcast success")
             return True
         else:
-            print("$26A0$FE0F LINE API error:", r.status_code, r.text)
+            print("⚠️ LINE API error:", r.status_code, r.text)
             return False
     except Exception as e:
-        print("$274C send exception:", e)
+        print("❌ send exception:", e)
         return False
 
+def send_text_messages(texts):
+    """
+    LINEは1リクエストで最大5メッセージまで送れるため分割して送る。
+    """
+    chunk = 5
+    ok_all = True
+    for i in range(0, len(texts), chunk):
+        batch = texts[i:i+chunk]
+        message_objs = [{"type":"text","text":t} for t in batch]
+        ok = post_broadcast(message_objs)
+        ok_all = ok_all and ok
+        time.sleep(0.8)  # 軽い間隔を空ける（レート制限配慮）
+    return ok_all
 
 # --------------------
 # main
 # --------------------
-
 def main():
     sent = load_sent_ids()
     new_sent = set(sent)
     entries = fetch_all_entries()
     print("entries:", len(entries))
+
     candidates = []
     for e in entries:
         uid = e.get("id", e.get("link"))
         if not uid or uid in sent:
             continue
-        title = e.get("title", "")
+        title = e.get("title", "") or ""
         summary = (e.get("summary") or e.get("description") or "") or ""
         brand = detect_brand(title, summary)
         gr86 = is_gr86_text(title, summary)
         if not brand and not gr86:
             continue
         link = e.get("link", "")
-        candidates.append((gr86, brand or "（不明）", uid, title, summary, link))
+        pub = e.get("published") or e.get("updated") or ""
+        candidates.append((gr86, brand or "（不明）", title, summary, link, pub, uid))
 
-    # GR優先
+    # GR/GR86優先
     candidates.sort(key=lambda x: (0 if x[0] else 1))
+
+    # 送信対象を絞る（必要に応じて増減）
     to_send = candidates[:MAX_POSTS_PER_RUN]
     print("send candidates:", len(to_send))
     if not to_send:
-        print("$2705 0件送信完了")
+        print("✅ 0件送信完了")
         return
 
-    bubbles = []
-    for gr86, brand, uid, title, summary, link in to_send:
-        img = fetch_og_image(link) or DEFAULT_IMAGE
-        bubble = make_flex_bubble(title, brand, link, image_url=img, is_gr86=gr86)
-        bubbles.append(bubble)
-        new_sent.add(uid)
+    # テキスト化（uidは別管理）
+    items = [(c[0], c[1], c[2], c[3], c[5], c[4]) for c in to_send]  # (gr86, brand, title, summary, pub, link) に並べ替え
+    texts = build_text_messages(items)
 
-    ok = send_flex_messages(bubbles)
+    ok = send_text_messages(texts)
     if ok:
+        for c in to_send:
+            new_sent.add(c[6])  # uid追加
         save_sent_ids(new_sent)
-        print(f"$2705 {len(bubbles)}件送信完了")
+        print(f"✅ {len(texts)}メッセージ送信完了 / {len(to_send)}記事")
     else:
-        print("$274C LINE送信失敗")
-
+        print("❌ LINE送信失敗")
 
 if __name__ == "__main__":
     try:
