@@ -1,5 +1,4 @@
 venv/
 __pycache__/
-
 *.pyc
 sent_ids.json
