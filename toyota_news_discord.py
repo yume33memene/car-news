@@ -1,61 +1,98 @@
-#!/usr/bin/env python3
-d = feedparser.parse(feed_url)
-except Exception as e:
-print("feed parse err:", e)
-continue
-for entry in d.entries[:12]:
-eid = entry_id(entry)
-if eid in sent:
-continue
-text_blob = " ".join([entry.get("title",""), entry.get("summary","") or ""])
-is_gr = is_gr86_text(text_blob)
-embed = make_embed(entry, brand, is_gr)
-to_post_embeds.append((is_gr, eid, embed))
+import os
+import feedparser
+import requests
+import json
+from datetime import datetime
+
+# Webhook URL (GitHub Secrets で設定)
+WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK")
+
+# ニュース対象ブランド
+BRANDS = ["トヨタ", "GR86", "スバル", "日産", "ホンダ"]
+
+# 記事ID管理ファイル
+SENT_IDS_FILE = "sent_ids.json"
 
 
-# 優先度：GR86 を先に並べる
-to_post_embeds.sort(key=lambda x: (0 if x[0] else 1))
+def load_sent_ids():
+    """送信済み記事IDを読み込み"""
+    if not os.path.exists(SENT_IDS_FILE):
+        return set()
+    with open(SENT_IDS_FILE, "r", encoding="utf-8") as f:
+        try:
+            return set(json.load(f))
+        except json.JSONDecodeError:
+            return set()
 
 
-# Discord は一度に最大10 embeds（Webhook制限）なので分割して投げる
-batched = []
-batch = []
-for _, eid, emb in to_post_embeds:
-batch.append((eid, emb))
-if len(batch) >= 8:
-batched.append(batch)
-batch = []
-if batch: batched.append(batch)
+def save_sent_ids(sent_ids):
+    """送信済み記事IDを保存"""
+    with open(SENT_IDS_FILE, "w", encoding="utf-8") as f:
+        json.dump(list(sent_ids), f, ensure_ascii=False, indent=2)
 
 
-any_sent = False
-for batch in batched:
-embeds = [b for (_, b) in batch]
-ok = post_to_discord(embeds)
-if ok:
-for eid, _ in batch:
-sent.add(eid)
-any_sent = True
-time.sleep(1.2)
+def fetch_toyota_news():
+    """トヨタ公式ニュースRSSから記事を取得"""
+    feeds = [
+        "https://global.toyota/jp/newsroom/rss",
+        "https://toyotagazooracing.com/jp/rss.xml",
+    ]
+    entries = []
+    for url in feeds:
+        feed = feedparser.parse(url)
+        entries.extend(feed.entries)
+    return entries
 
 
-if any_sent:
-save_sent(sent)
-# commit sent_ids.json back to repo using GITHUB_TOKEN (available in Actions)
-gh_token = os.environ.get("GITHUB_TOKEN")
-repo = os.environ.get("GITHUB_REPOSITORY") # owner/repo
-if gh_token and repo:
-try:
-subprocess.run(["git", "config", "user.email", "actions@github.com"], check=True)
-subprocess.run(["git", "config", "user.name", "github-actions"], check=True)
-subprocess.run(["git", "add", SENT_FILE], check=True)
-subprocess.run(["git", "commit", "-m", "Update sent_ids.json by workflow"], check=True)
-push_url = f"https://x-access-token:{gh_token}@github.com/{repo}.git"
-subprocess.run(["git", "push", push_url, "HEAD:refs/heads/main"], check=True)
-print("Committed sent_ids.json")
-except Exception as e:
-print("Git commit/push error:", e)
+def make_embed(entry):
+    """Discord用Embedデータを作成"""
+    title = entry.title
+    link = entry.link
+    date = entry.published if "published" in entry else ""
+    summary = entry.summary[:150] + "..." if "summary" in entry else ""
+    embed = {
+        "title": title,
+        "url": link,
+        "description": summary,
+        "color": 0xE60012,  # トヨタ赤
+        "footer": {"text": date},
+    }
+    return embed
+
+
+def post_to_discord(embed):
+    """Discordに投稿"""
+    payload = {"embeds": [embed]}
+    response = requests.post(WEBHOOK_URL, json=payload)
+    if response.status_code != 204:
+        print("⚠️ Discord投稿エラー:", response.status_code, response.text)
+
+
+def main():
+    sent_ids = load_sent_ids()
+    new_sent_ids = set(sent_ids)
+
+    entries = fetch_toyota_news()
+
+    for entry in entries:
+        uid = entry.get("id", entry.get("link"))
+        if uid in sent_ids:
+            continue
+
+        title = entry.get("title", "")
+        if not any(keyword in title for keyword in BRANDS):
+            continue
+
+        embed = make_embed(entry)
+        post_to_discord(embed)
+        new_sent_ids.add(uid)
+
+    save_sent_ids(new_sent_ids)
+    print(f"✅ 投稿完了 {len(new_sent_ids) - len(sent_ids)} 件")
 
 
 if __name__ == "__main__":
-main()
+    try:
+        main()
+    except Exception as e:
+        print("❌ エラー発生:", e)
