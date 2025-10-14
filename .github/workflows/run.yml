@@ -1,0 +1,27 @@
+name: Toyota News -> Discord
+on:
+schedule:
+- cron: '0 * * * *' # 毎時 0分（1時間ごと）に実行
+workflow_dispatch:
+
+
+jobs:
+run:
+runs-on: ubuntu-latest
+steps:
+- name: Checkout
+uses: actions/checkout@v4
+with:
+persist-credentials: true # GITHUB_TOKEN を使う
+- name: Setup Python
+uses: actions/setup-python@v4
+with:
+python-version: '3.11'
+- name: Install deps
+run: pip install feedparser requests beautifulsoup4
+- name: Run bot
+env:
+DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # ここは自動で使われます
+GITHUB_REPOSITORY: ${{ github.repository }}
+run: python3 toyota_news_discord.py
