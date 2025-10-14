@@ -1,9 +1,10 @@
-name: Toyota News to Discord
+name: Japanese Car News -> LINE (Flex)
 
 on:
-  workflow_dispatch:
   schedule:
-    - cron: '0 * * * *'  # 毎時実行
+    - cron: '0 3 * * *'  # 12:00 JST
+    - cron: '0 6 * * *'  # 15:00 JST
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -11,33 +12,30 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           persist-credentials: true
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Install dependencies
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run bot
+      - name: Run LINE Flex bot
         env:
-          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          LINE_CHANNEL_TOKEN: ${{ secrets.LINE_CHANNEL_TOKEN }}
         run: |
-          python toyota_news_discord.py
+          python japanese_car_news_line_flex.py
 
-      - name: Commit updated sent_ids.json
+      - name: Commit sent_ids.json (if changed)
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.email "actions@github.com"
+          git config user.name "github-actions"
           git add sent_ids.json
           git commit -m "Update sent_ids.json" || echo "No changes to commit"
           git push
