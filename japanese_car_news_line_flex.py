@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# japanese_car_news_line_text_broadcast.py
+# japanese_car_news_line_text_batched.py
 # requirements: feedparser, requests, beautifulsoup4
 
 import os
@@ -7,7 +7,6 @@ import json
 import time
 import feedparser
 import requests
-from bs4 import BeautifulSoup
 from urllib.parse import urlparse
 from datetime import datetime
 
@@ -17,8 +16,11 @@ from datetime import datetime
 LINE_TOKEN = os.getenv("LINE_CHANNEL_TOKEN")
 SENT_FILE = "sent_ids.json"
 
-# できるだけ多く届けたい前提で増やす（過剰配信はプランや月間上限に注意）
-MAX_POSTS_PER_RUN = 30
+# 収集・配信件数（柔軟に調整可）
+MAX_POSTS_PER_RUN = 50               # まとめて拾い、あとで文字数で安全分割
+MAX_UNITS_PER_TEXT = 4800            # 安全側に5,000未満で分割（UTF-16コード単位）
+MAX_MSG_OBJECTS_PER_REQUEST = 5      # LINEの1リクエスト上限（仕様）
+SLEEP_BETWEEN_REQUESTS = 0.8         # 連続broadcastの間隔（レート制限配慮）
 
 BRANDS = [
     "トヨタ", "レクサス", "GR", "GR86",
@@ -47,9 +49,6 @@ RSS_URLS = [
     "https://bestcarweb.jp/rss",
 ]
 
-# og:image 取得は残してもテキスト主体なので未使用（必要なら本文へURL掲載でも可）
-DEFAULT_IMAGE = "https://raw.githubusercontent.com/your-username/your-repo/main/assets/default_card.jpg"
-
 # --------------------
 # ユーティリティ
 # --------------------
@@ -65,28 +64,6 @@ def load_sent_ids():
 def save_sent_ids(s):
     with open(SENT_FILE, "w", encoding="utf-8") as f:
         json.dump(sorted(list(s)), f, ensure_ascii=False, indent=2)
-
-def short(text, n=800):
-    if not text:
-        return ""
-    t = " ".join(text.split())
-    return (t[: n - 1] + "…") if len(t) > n else t
-
-def fetch_og_image(url):
-    try:
-        r = requests.get(url, timeout=6, headers={"User-Agent":"Mozilla/5.0"})
-        if r.status_code != 200:
-            return None
-        soup = BeautifulSoup(r.text, "html.parser")
-        og = soup.find("meta", property="og:image")
-        if og and og.get("content"):
-            return og["content"]
-        tc = soup.find("meta", attrs={"name":"twitter:image"})
-        if tc and tc.get("content"):
-            return tc["content"]
-    except Exception:
-        return None
-    return None
 
 def detect_brand(title, summary=""):
     text = (title + " " + summary).lower()
@@ -109,9 +86,9 @@ def domain_of(url):
     except Exception:
         return ""
 
-# --- UTF-16のコード単位数を正確に数える（LINEの文字数上限対策） ---
+# --- UTF-16コード単位での文字数カウント（LINE仕様準拠） ---
 def utf16_units(s: str) -> int:
-    # UTF-16-LEに変換したバイト長 / 2 がコード単位数
+    # UTF-16-LE変換のバイト長 / 2 = コード単位数
     return len(s.encode("utf-16-le")) // 2
 
 # --------------------
@@ -135,56 +112,42 @@ def fetch_all_entries():
     return entries
 
 # --------------------
-# テキスト生成
+# テキスト生成（題名・公開日・URLのみ／超シンプル）
 # --------------------
-def render_item(gr86, brand, title, summary, link, pub):
-    # 絵文字は上限超過の原因になり得るため使用しない（安全運用）
-    lines = []
-    head = f"[{brand}] {title}"
-    lines.append(head)
-    if pub:
-        try:
-            # pub は文字列のことがあるのでそのまま表示
-            lines.append(f"公開日: {pub}")
-        except Exception:
-            pass
-    dom = domain_of(link)
-    if summary:
-        lines.append(f"概要: {short(summary, n=800)}")
-    lines.append(f"URL: {link}")
-    if dom:
-        lines.append(f"ソース: {dom}")
+def render_item(title, pub, link):
+    # できるだけ見やすく・短く
+    pub_txt = pub or ""
+    lines = [
+        f"題名: {title}",
+        f"公開日: {pub_txt}",
+        f"URL: {link}",
+    ]
     return "\n".join(lines)
 
-def build_text_messages(items, max_units_per_message=4800):
+def build_text_messages(items, max_units=MAX_UNITS_PER_TEXT):
     """
-    items: [(gr86, brand, title, summary, link, pub), ...]
-    できるだけ多くの記事を1メッセージに詰め、UTF-16単位の上限内で分割。
+    items: [(title, pub, link), ...]
+    UTF-16単位の上限内で複数のテキストメッセージに安全分割。
     """
     messages = []
-    current = []
-    # ヘッダー（日時付き）
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
-    header = f"自動車ニュースまとめ（{now}）\n"
-    cur_text = header
-    for it in items:
-        block = render_item(*it)
-        # 区切り線
-        block = block + "\n" + ("-" * 24) + "\n"
-        # 追加した場合の長さを見積もり
-        if utf16_units(cur_text + block) <= max_units_per_message:
-            cur_text += block
+    header = f"自動車ニュース速報（{now}）\n\n"
+    cur = header
+
+    for (title, pub, link) in items:
+        block = render_item(title, pub, link) + "\n" + ("-" * 20) + "\n"
+        if utf16_units(cur + block) <= max_units:
+            cur += block
         else:
-            # 現在のメッセージを確定
-            messages.append(cur_text.strip())
-            # 新しいメッセージを開始
-            cur_text = header + block
-    if cur_text.strip():
-        messages.append(cur_text.strip())
+            messages.append(cur.strip())
+            cur = header + block
+
+    if cur.strip():
+        messages.append(cur.strip())
     return messages
 
 # --------------------
-# LINE送信: テキスト（broadcast）
+# LINE送信（/broadcastを5件ずつバッチ）
 # --------------------
 def post_broadcast(message_objs):
     if not LINE_TOKEN:
@@ -196,7 +159,7 @@ def post_broadcast(message_objs):
     try:
         r = requests.post(url, headers=headers, json=payload, timeout=20)
         if r.status_code in (200,201):
-            print("✅ LINE text broadcast success")
+            print("✅ broadcast success:", len(message_objs))
             return True
         else:
             print("⚠️ LINE API error:", r.status_code, r.text)
@@ -205,18 +168,14 @@ def post_broadcast(message_objs):
         print("❌ send exception:", e)
         return False
 
-def send_text_messages(texts):
-    """
-    LINEは1リクエストで最大5メッセージまで送れるため分割して送る。
-    """
-    chunk = 5
+def send_broadcast_in_batches(texts, batch_size=MAX_MSG_OBJECTS_PER_REQUEST):
     ok_all = True
-    for i in range(0, len(texts), chunk):
-        batch = texts[i:i+chunk]
-        message_objs = [{"type":"text","text":t} for t in batch]
+    for i in range(0, len(texts), batch_size):
+        chunk = texts[i:i+batch_size]
+        message_objs = [{"type":"text","text":t} for t in chunk]  # テキストのみ
         ok = post_broadcast(message_objs)
         ok_all = ok_all and ok
-        time.sleep(0.8)  # 軽い間隔を空ける（レート制限配慮）
+        time.sleep(SLEEP_BETWEEN_REQUESTS)
     return ok_all
 
 # --------------------
@@ -228,41 +187,45 @@ def main():
     entries = fetch_all_entries()
     print("entries:", len(entries))
 
+    # 抽出（重複排除＆ブランド・GR86関連のみ）
     candidates = []
     for e in entries:
         uid = e.get("id", e.get("link"))
         if not uid or uid in sent:
             continue
+
         title = e.get("title", "") or ""
         summary = (e.get("summary") or e.get("description") or "") or ""
         brand = detect_brand(title, summary)
         gr86 = is_gr86_text(title, summary)
         if not brand and not gr86:
             continue
+
         link = e.get("link", "")
         pub = e.get("published") or e.get("updated") or ""
-        candidates.append((gr86, brand or "（不明）", title, summary, link, pub, uid))
+        candidates.append((gr86, title, pub, link, uid))
 
     # GR/GR86優先
     candidates.sort(key=lambda x: (0 if x[0] else 1))
 
-    # 送信対象を絞る（必要に応じて増減）
-    to_send = candidates[:MAX_POSTS_PER_RUN]
-    print("send candidates:", len(to_send))
-    if not to_send:
+    # 上限まで選択
+    picked = candidates[:MAX_POSTS_PER_RUN]
+    print("picked:", len(picked))
+    if not picked:
         print("✅ 0件送信完了")
         return
 
-    # テキスト化（uidは別管理）
-    items = [(c[0], c[1], c[2], c[3], c[5], c[4]) for c in to_send]  # (gr86, brand, title, summary, pub, link) に並べ替え
-    texts = build_text_messages(items)
+    # テキスト化（題名・公開日・URLのみ）
+    items = [(c[1], c[2], c[3]) for c in picked]
+    texts = build_text_messages(items, max_units=MAX_UNITS_PER_TEXT)
 
-    ok = send_text_messages(texts)
+    # 5件ずつバッチで /broadcast
+    ok = send_broadcast_in_batches(texts, batch_size=MAX_MSG_OBJECTS_PER_REQUEST)
     if ok:
-        for c in to_send:
-            new_sent.add(c[6])  # uid追加
+        for c in picked:
+            new_sent.add(c[4])
         save_sent_ids(new_sent)
-        print(f"✅ {len(texts)}メッセージ送信完了 / {len(to_send)}記事")
+        print(f"✅ {len(texts)}メッセージ送信（合計{len(picked)}記事）完了")
     else:
         print("❌ LINE送信失敗")
 
